@@ -1,0 +1,172 @@
+#Build the cluster
+
+#Launch Cloud9 in your closest region:
+
+#Select Create environment
+
+#Name it eksworkshop, click Next.
+
+#Choose t3.small for instance type, take all default values and click Create environment
+
+#When it comes up, customize the environment by:
+
+#Closing the Welcome tab
+
+#Opening a new terminal tab in the main work area
+
+#Closing the lower work area
+
+#Increase the disk size on the Cloud9 instance
+
+pip3 install --user --upgrade boto3
+export instance_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+python -c "import boto3
+import os
+from botocore.exceptions import ClientError 
+ec2 = boto3.client('ec2')
+volume_info = ec2.describe_volumes(
+    Filters=[
+        {
+            'Name': 'attachment.instance-id',
+            'Values': [
+                os.getenv('instance_id')
+            ]
+        }
+    ]
+)
+volume_id = volume_info['Volumes'][0]['VolumeId']
+try:
+    resize = ec2.modify_volume(    
+            VolumeId=volume_id,    
+            Size=30
+    )
+    print(resize)
+except ClientError as e:
+    if e.response['Error']['Code'] == 'InvalidParameterValue':
+        print('ERROR MESSAGE: {}'.format(e))"
+if [ $? -eq 0 ]; then
+    sudo reboot
+fi
+
+#Install kubectl
+
+sudo curl --silent --location -o /usr/local/bin/kubectl \
+   https://amazon-eks.s3.us-west-2.amazonaws.com/1.17.11/2020-09-18/bin/linux/amd64/kubectl
+
+sudo chmod +x /usr/local/bin/kubectl
+
+#Update awscli
+
+sudo pip install --upgrade awscli && hash -r
+
+#Install jq, envsubst (from GNU gettext utilities) and bash-completion
+
+sudo yum -y install jq gettext bash-completion moreutils
+
+#Install yq for yaml processing
+
+echo 'yq() {
+  docker run --rm -i -v "${PWD}":/workdir mikefarah/yq "$@"
+}' | tee -a ~/.bashrc && source ~/.bashrc
+
+#Verify the binaries are in the path and executable
+
+for command in kubectl jq envsubst aws
+  do
+    which $command &>/dev/null && echo "$command in path" || echo "$command NOT FOUND"
+  done
+
+#Enable kubectl bash_completion
+
+kubectl completion bash >>  ~/.bash_completion
+. /etc/profile.d/bash_completion.sh
+. ~/.bash_completion
+
+#set the AWS Load Balancer Controller version
+
+echo 'export LBC_VERSION="v2.0.0"' >>  ~/.bash_profile
+.  ~/.bash_profile
+
+#CREATE AN IAM ROLE FOR YOUR WORKSPACE
+#Confirm that AWS service and EC2 are selected, then click Next: Permissions to view permissions.#
+#Confirm that AdministratorAccess is checked, then click Next: Tags to assign tags.
+#Take the defaults, and click Next: Review to review.
+#Enter eksworkshop-admin for the Name, and click Create role.
+#Click the grey circle button (in top right corner) and select Manage EC2 Instance
+#Select the instance, then choose Actions / Security / Modify IAM Role
+#Choose eksworkshop-admin from the IAM Role drop down, and select Save
+
+#UPDATE IAM SETTINGS FOR YOUR WORKSPACE
+#Return to your Cloud9 workspace and click the gear icon (in top right corner)
+#Select AWS SETTINGS
+#Turn off AWS managed temporary credentials
+#Close the Preferences tab
+
+#To ensure temporary credentials aren’t already in place we will also remove any existing credentials file:
+
+rm -vf ${HOME}/.aws/credentials
+
+#We should configure our aws cli with our current region as default.
+
+export ACCOUNT_ID=$(aws sts get-caller-identity --output text --query Account)
+export AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r '.region')
+export AZS=($(aws ec2 describe-availability-zones --query 'AvailabilityZones[].ZoneName' --output text --region $AWS_REGION))
+
+#Check if AWS_REGION is set to desired region
+
+test -n "$AWS_REGION" && echo AWS_REGION is "$AWS_REGION" || echo AWS_REGION is not set
+
+#Let’s save these into bash_profile
+
+echo "export ACCOUNT_ID=${ACCOUNT_ID}" | tee -a ~/.bash_profile
+echo "export AWS_REGION=${AWS_REGION}" | tee -a ~/.bash_profile
+echo "export AZS=(${AZS[@]})" | tee -a ~/.bash_profile
+aws configure set default.region ${AWS_REGION}
+aws configure get default.region
+
+#Use the GetCallerIdentity CLI command to validate that the Cloud9 IDE is using the correct IAM role
+
+aws sts get-caller-identity --query Arn | grep eksworkshop-admin -q && echo "IAM role valid" || echo "IAM role NOT valid"
+
+#CLONE THE SERVICE REPOS
+cd ~/environment
+git clone https://github.com/brentley/ecsdemo-frontend.git
+git clone https://github.com/brentley/ecsdemo-nodejs.git
+git clone https://github.com/brentley/ecsdemo-crystal.git
+
+#Please run this command to generate SSH Key in Cloud9. This key will be used on the worker node instances to allow ssh access if necessary.
+
+ssh-keygen
+
+#Press enter 3 times to take the default choices
+#Upload the public key to your EC2 region:
+
+aws ec2 import-key-pair --key-name "eksworkshop" --public-key-material file://~/.ssh/id_rsa.pub
+
+#Create a CMK for the EKS cluster to use when encrypting your Kubernetes secrets:
+
+aws kms create-alias --alias-name alias/eksworkshop --target-key-id $(aws kms create-key --query KeyMetadata.Arn --output text)
+
+#Let’s retrieve the ARN of the CMK to input into the create cluster command.
+
+export MASTER_ARN=$(aws kms describe-key --key-id alias/eksworkshop --query KeyMetadata.Arn --output text)
+
+#Now, let’s save the MASTER_ARN environment variable into the bash_profile
+
+echo "export MASTER_ARN=${MASTER_ARN}" | tee -a ~/.bash_profile
+
+#For this module, we need to download the eksctl binary:
+
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+
+sudo mv -v /tmp/eksctl /usr/local/bin
+
+#Confirm the eksctl command works:
+
+eksctl version
+
+#Enable eksctl bash-completion
+
+eksctl completion bash >> ~/.bash_completion
+. /etc/profile.d/bash_completion.sh
+. ~/.bash_completion

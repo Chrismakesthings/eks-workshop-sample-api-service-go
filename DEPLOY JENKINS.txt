@@ -1,0 +1,213 @@
+#DEPLOY JENKINS
+#We’ll start by creating a CodeCommit repository to store our example application. This repository will store our application code
+# and Jenkinsfile.
+
+aws codecommit create-repository --repository-name eksworkshop-app
+
+#We’ll create an IAM user with our HTTPS Git credentials for AWS CodeCommit to clone our repository and to push additional commits. 
+#This user needs an IAM Policy for access to CodeCommit
+
+aws iam create-user \
+  --user-name git-user
+
+aws iam attach-user-policy \
+  --user-name git-user \
+  --policy-arn arn:aws:iam::aws:policy/AWSCodeCommitPowerUser
+
+aws iam create-service-specific-credential \
+  --user-name git-user --service-name codecommit.amazonaws.com \
+  | tee /tmp/gituser_output.json
+
+GIT_USERNAME=$(cat /tmp/gituser_output.json | jq -r '.ServiceSpecificCredential.ServiceUserName')
+GIT_PASSWORD=$(cat /tmp/gituser_output.json | jq -r '.ServiceSpecificCredential.ServicePassword')
+CREDENTIAL_ID=$(cat /tmp/gituser_output.json | jq -r '.ServiceSpecificCredential.ServiceSpecificCredentialId')
+
+#The repository will require some initial code so we’ll clone the repository and add a simple Go application.
+
+sudo pip install git-remote-codecommit
+
+git clone codecommit::${AWS_REGION}://eksworkshop-app
+cd eksworkshop-app
+
+#server.go contains our simple application.
+
+cat << EOF > server.go
+
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func helloWorld(w http.ResponseWriter, r *http.Request){
+    fmt.Fprintf(w, "Hello World")
+}
+
+func main() {
+    http.HandleFunc("/", helloWorld)
+    http.ListenAndServe(":8080", nil)
+}
+EOF
+
+#server_test.go contains our unit tests.
+
+cat << EOF > server_test.go
+
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func Test_helloWorld(t *testing.T) {
+	req, err := http.NewRequest("GET", "http://domain.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := httptest.NewRecorder()
+	helloWorld(res, req)
+
+	exp := "Hello World"
+	act := res.Body.String()
+	if exp != act {
+		t.Fatalf("Expected %s got %s", exp, act)
+	}
+}
+
+EOF
+
+#The Jenkinsfile will contain our pipeline declaration, the additional containers in our build agent pods, and which container will
+# be used for each step of the pipeline.
+
+cat << EOF > Jenkinsfile
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: golang
+    image: golang:1.13
+    command:
+    - cat
+    tty: true
+"""
+    }
+  }
+  stages {
+    stage('Run tests') {
+      steps {
+        container('golang') {
+          sh 'go test'
+        }
+      }
+    }
+    stage('Build') {
+        steps {
+            container('golang') {
+              sh 'go build -o eksworkshop-app'
+              archiveArtifacts "eksworkshop-app"
+            }
+            
+        }
+    }
+    
+  }
+}
+
+EOF
+
+#We’ll add the code our code, commit the change, and then push the code to our repository
+
+git add --all && git commit -m "Initial commit." && git push
+cd ~/environment
+
+#CREATING THE JENKINS SERVICE ACCOUNT
+
+eksctl create iamserviceaccount \
+    --name jenkins \
+    --namespace default \
+    --cluster eksworkshop-eksctl \
+    --attach-policy-arn arn:aws:iam::aws:policy/AWSCodeCommitPowerUser \
+    --approve \
+    --override-existing-serviceaccounts
+
+#Install Jenkins
+
+cat << EOF > values.yaml
+---
+master:
+  additionalPlugins:
+    - aws-codecommit-jobs:0.3.0
+  resources:
+    requests:
+      cpu: "1024m"
+      memory: "4Gi"
+    limits:
+      cpu: "4096m"
+      memory: "8Gi"
+  javaOpts: "-Xms4000m -Xmx4000m"
+  servicePort: 80
+  serviceType: LoadBalancer
+agent:
+  Enabled: false
+rbac:
+  create: true
+serviceAccount:
+  create: false
+  name: "jenkins"
+EOF
+
+#Now we’ll use the helm cli to create the Jenkins server as we’ve declared it in the values.yaml file.
+
+helm install cicd stable/jenkins -f values.yaml
+
+#The output of this command will give you some additional information such as the admin password and the way to get the host name of
+#the ELB that was provisioned. Let’s give this some time to provision and while we do let’s watch for pods to boot
+
+kubectl get pods -w
+
+#You should see the pods in init, pending or running state. Once this changes to running we can get the load balancer address.
+
+export SERVICE_IP=$(kubectl get svc --namespace default cicd-jenkins --template "{{ range (index .status.loadBalancer.ingress 0) }}{{ . }}{{ end }}")
+
+echo http://$SERVICE_IP/login
+
+#This service was configured with a LoadBalancer so, an AWS Elastic Load Balancer (ELB) is launched by Kubernetes for the service. The EXTERNAL-IP 
+#column contains a value that ends with “elb.amazonaws.com” - the full value is the DNS address.
+
+When the front-end service is first deployed, it can take up to several minutes for the ELB to be created and DNS updated. During this time
+# the link above may display a “site unreachable” message. To check if the instances are in service, 
+#follow this deep link to the load balancer console. On the load balancer select the instances tab and ensure that the instance status
+# is listed as “InService” before proceeding to the jenkins login page.
+#Now that we have the ELB address of your jenkins instance we can go an navigate to that address in another window.
+
+#From here we can log in using:
+
+printf $(kubectl get secret --namespace default cicd-jenkins -o jsonpath="{.data.jenkins-admin-password}" | base64 --decode);echo
+
+#After logging into the Jenkins web console, we’re ready to add our eksworkshop-app repository. Start by selecting New Item in the menu 
+#on the left side.
+#Set the name of the item to codecommit and select the AWS Code commit item type
+#In your Cloud9 workspace, execute the following commands to get your Git username and password
+
+echo $GIT_USERNAME
+echo $GIT_PASSWORD
+
+#Back to Jenkins. In the Projects section, to the right of Code Commit Credentials, select Add then CodeCommit.
+#Set the Username and Password to the corresponding values from the previous command and click Add.
+#Confirm your current AWS Region.
+
+echo https://codecommit.$AWS_REGION.amazonaws.com
+
+#Copy that value to theURL field under project and select your use from the Code Commit Credentials DropDown menu
+#Select Save at the bottom left of the screen. Jenkins will begin executing the pipelines in repositories and branches that contain a Jenkinsfile.
+
+
+
